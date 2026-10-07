@@ -345,9 +345,24 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
 }
 
 pub(crate) struct ProcessedTranscription {
+    /// Still contains spoken-period markers until the actual insertion context is known.
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    formatting: crate::text_formatting::TextFormatting,
+}
+
+impl ProcessedTranscription {
+    pub(crate) fn finalize(&mut self, capitalization: Option<bool>) {
+        self.final_text = crate::text_formatting::finish_with_context(
+            &self.final_text,
+            &self.formatting,
+            capitalization,
+        );
+        if self.post_processed_text.is_some() {
+            self.post_processed_text = Some(self.final_text.clone());
+        }
+    }
 }
 
 pub(crate) async fn process_transcription_output(
@@ -356,16 +371,6 @@ pub(crate) async fn process_transcription_output(
     post_process: bool,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
-    let cursor_capitalization = if settings.text_formatting.enabled
-        && settings.text_formatting.initial_capitalization
-            == crate::text_formatting::InitialCapitalization::AfterPeriod
-    {
-        crate::editor_context::capitalization()
-    } else {
-        None
-    };
-    // Keep the identity with this dictation even if AI processing resumes on another thread.
-    let cursor_target = crate::editor_context::target();
     let mut final_text = if post_process {
         crate::text_formatting::replace_spoken(transcription, &settings.text_formatting)
     } else {
@@ -407,20 +412,11 @@ pub(crate) async fn process_transcription_output(
         }
     }
 
-    final_text = crate::text_formatting::finish_dictation_for_target(
-        &final_text,
-        &settings.text_formatting,
-        cursor_capitalization,
-        cursor_target,
-    );
-    if post_processed_text.is_some() {
-        post_processed_text = Some(final_text.clone());
-    }
-
     ProcessedTranscription {
         final_text,
         post_processed_text,
         post_process_prompt,
+        formatting: settings.text_formatting,
     }
 }
 
@@ -466,6 +462,16 @@ impl ShortcutAction for TranscribeAction {
         let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
+
+        if settings.text_formatting.enabled
+            && settings.text_formatting.initial_capitalization
+                == crate::text_formatting::InitialCapitalization::AfterPeriod
+        {
+            // Electron may need time to expose its accessibility tree. Start
+            // warming it while the user speaks, without delaying microphone
+            // capture or remembering any editor text/continuation state.
+            std::thread::spawn(crate::editor_context::prepare);
+        }
 
         let selected_model_info = app
             .state::<Arc<ModelManager>>()
@@ -746,7 +752,7 @@ impl ShortcutAction for TranscribeAction {
                                     show_processing_overlay(&ah);
                                 }
                             }
-                            let Some(processed) = complete_unless_cancelled(
+                            let Some(mut processed) = complete_unless_cancelled(
                                 process_transcription_output(&ah, &transcription, post_process),
                                 || rm.was_cancelled_since(cancel_generation),
                             )
@@ -765,38 +771,48 @@ impl ShortcutAction for TranscribeAction {
                                 return;
                             }
 
-                            // Save to history if WAV was saved
-                            if wav_saved {
-                                if let Err(err) = hm.save_entry(
-                                    file_name,
-                                    transcription,
-                                    post_process,
-                                    processed.post_processed_text.clone(),
-                                    processed.post_process_prompt.clone(),
-                                ) {
-                                    error!("Failed to save history entry: {}", err);
+                            let ah_clone = ah.clone();
+                            let paste_time = Instant::now();
+                            let rm_for_paste = Arc::clone(&rm);
+                            ah.run_on_main_thread(move || {
+                                if rm_for_paste.was_cancelled_since(cancel_generation) {
+                                    debug!("Transcription operation cancelled before paste");
+                                    utils::hide_recording_overlay(&ah_clone);
+                                    set_tray_state(&ah_clone, TrayIconState::Idle);
+                                    return;
                                 }
-                            }
 
-                            if processed.final_text.is_empty() {
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                            } else {
-                                let ah_clone = ah.clone();
-                                let paste_time = Instant::now();
-                                let final_text = processed.final_text;
-                                let rm_for_paste = Arc::clone(&rm);
-                                ah.run_on_main_thread(move || {
-                                    if rm_for_paste.was_cancelled_since(cancel_generation) {
-                                        debug!("Transcription operation cancelled before paste");
-                                        utils::hide_recording_overlay(&ah_clone);
-                                        set_tray_state(&ah_clone, TrayIconState::Idle);
-                                        return;
-                                    }
+                                // Read the insertion point after every async operation,
+                                // immediately before formatting and dispatching the paste.
+                                let context = if processed.formatting.enabled
+                                    && processed.formatting.initial_capitalization
+                                        == crate::text_formatting::InitialCapitalization::AfterPeriod
+                                {
+                                    crate::editor_context::capture()
+                                } else {
+                                    crate::editor_context::Snapshot::default()
+                                };
+                                processed.finalize(context.capitalization());
 
-                                    match utils::paste(final_text, ah_clone.clone()) {
+                                if rm_for_paste.was_cancelled_since(cancel_generation) {
+                                    debug!("Transcription operation cancelled while reading editor context");
+                                    utils::hide_recording_overlay(&ah_clone);
+                                    set_tray_state(&ah_clone, TrayIconState::Idle);
+                                    return;
+                                }
+
+                                if !processed.final_text.is_empty() {
+                                    let completion =
+                                        crate::clipboard::PasteCompletion::new(move |output| {
+                                            crate::editor_context::commit(&context, output)
+                                        });
+                                    match utils::paste(
+                                        processed.final_text,
+                                        ah_clone.clone(),
+                                        completion,
+                                    ) {
                                         Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
+                                            "Text paste dispatched in {:?}",
                                             paste_time.elapsed()
                                         ),
                                         Err(e) => {
@@ -804,15 +820,27 @@ impl ShortcutAction for TranscribeAction {
                                             let _ = ah_clone.emit("paste-error", ());
                                         }
                                     }
-                                    utils::hide_recording_overlay(&ah_clone);
-                                    set_tray_state(&ah_clone, TrayIconState::Idle);
-                                })
-                                .unwrap_or_else(|e| {
-                                    error!("Failed to run paste on main thread: {:?}", e);
-                                    utils::hide_recording_overlay(&ah);
-                                    set_tray_state(&ah, TrayIconState::Idle);
-                                });
-                            }
+                                }
+                                if wav_saved {
+                                    if let Err(err) = hm.save_entry(
+                                        file_name,
+                                        transcription,
+                                        post_process,
+                                        processed.post_processed_text,
+                                        processed.post_process_prompt,
+                                    ) {
+                                        error!("Failed to save history entry: {}", err);
+                                    }
+                                }
+
+                                utils::hide_recording_overlay(&ah_clone);
+                                set_tray_state(&ah_clone, TrayIconState::Idle);
+                            })
+                            .unwrap_or_else(|e| {
+                                error!("Failed to run paste on main thread: {:?}", e);
+                                utils::hide_recording_overlay(&ah);
+                                set_tray_state(&ah, TrayIconState::Idle);
+                            });
                         }
                         Err(err) => {
                             if rm.was_cancelled_since(cancel_generation) {
@@ -925,7 +953,7 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 mod tests {
     use super::{
         complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        strip_think_block, ProcessedTranscription,
     };
     use crate::settings::OverlayStyle;
     use std::future;
@@ -933,6 +961,42 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn finalization_uses_latest_context_and_preserves_explicit_periods_in_history() {
+        let mut processed = ProcessedTranscription {
+            final_text: "Hello\u{e000} next sentence.".into(),
+            post_processed_text: Some("Hello\u{e000} next sentence.".into()),
+            post_process_prompt: Some("Clean up".into()),
+            formatting: crate::text_formatting::TextFormatting::default(),
+        };
+        processed.finalize(Some(false));
+        assert_eq!(processed.final_text, "hello. Next sentence");
+        assert_eq!(
+            processed.post_processed_text.as_deref(),
+            Some("hello. Next sentence")
+        );
+    }
+
+    #[test]
+    fn history_finalization_has_no_previous_dictation_dependency() {
+        let formatting = crate::text_formatting::TextFormatting::default();
+        let mut first = ProcessedTranscription {
+            final_text: "unfinished sentence".into(),
+            post_processed_text: None,
+            post_process_prompt: None,
+            formatting: formatting.clone(),
+        };
+        first.finalize(Some(false));
+        let mut retry = ProcessedTranscription {
+            final_text: "another sentence".into(),
+            post_processed_text: None,
+            post_process_prompt: None,
+            formatting,
+        };
+        retry.finalize(None);
+        assert_eq!(retry.final_text, "Another sentence");
+    }
 
     #[test]
     fn blank_transcription_is_detected() {

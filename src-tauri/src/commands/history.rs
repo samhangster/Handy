@@ -93,8 +93,11 @@ pub async fn retry_history_entry_transcription(
         return Err("Recording contains no speech".to_string());
     }
 
-    let processed =
+    let mut processed =
         process_transcription_output(&app, &transcription, entry.post_process_requested).await;
+    // Retrying history is a preview, not a dictation into the focused editor.
+    // Do not read or update the continuation state of an unrelated text field.
+    processed.finalize(None);
     history_manager
         .update_transcription(
             id,

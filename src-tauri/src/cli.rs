@@ -7,6 +7,9 @@ pub struct CliArgs {
     /// Preview local formatting against the focused editor without pasting or recording.
     #[arg(long, value_name = "TEXT")]
     pub format_preview: Option<String>,
+    /// Wait before sampling editor context, allowing focus to settle after launching the CLI.
+    #[arg(long, value_name = "MILLISECONDS", requires = "format_preview", value_parser = clap::value_parser!(u64).range(0..=10_000))]
+    pub format_preview_delay_ms: Option<u64>,
     /// Start with the main window hidden
     #[arg(long)]
     pub start_hidden: bool,
@@ -63,4 +66,30 @@ pub struct CliArgs {
     /// Emit --transcribe-file results as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formatting_preview_delay_is_bounded_and_requires_a_preview() {
+        assert!(CliArgs::try_parse_from([
+            "handy",
+            "--format-preview",
+            "Hello",
+            "--format-preview-delay-ms",
+            "10000"
+        ])
+        .is_ok());
+        assert!(CliArgs::try_parse_from([
+            "handy",
+            "--format-preview",
+            "Hello",
+            "--format-preview-delay-ms",
+            "10001"
+        ])
+        .is_err());
+        assert!(CliArgs::try_parse_from(["handy", "--format-preview-delay-ms", "1"]).is_err());
+    }
 }

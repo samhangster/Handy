@@ -26,7 +26,7 @@ use windows::Win32::Foundation::{
 };
 
 use super::{evaluate, send_chord, TxState, WaitDecision};
-use crate::clipboard::send_return_key;
+use crate::clipboard::{send_return_key, PasteCompletion};
 use crate::input::EnigoState;
 use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
 use windows::Win32::Foundation::GlobalFree;
@@ -76,6 +76,7 @@ pub(super) struct WinTxShared {
     /// ClipboardHandling::CopyToClipboard — settle by leaving the transcript
     /// on the clipboard as plain text instead of restoring the snapshot.
     preserve_transcript: bool,
+    completion: PasteCompletion,
 }
 
 /// The transaction currently holding the clipboard, if any. A new
@@ -221,14 +222,17 @@ fn flush_pending() {
     let Some(previous) = previous else {
         return;
     };
-    let receipt = {
+    let (receipt, injection_failed) = {
         let mut st = match previous.state.lock() {
             Ok(st) => st,
             Err(_) => return,
         };
         st.cancelled = true;
-        st.any_receipt_after_injection()
+        (st.any_receipt_after_injection(), st.injection_failed)
     };
+    if receipt && !injection_failed {
+        previous.completion.complete(&previous.text);
+    }
     if previous.auto_submit && receipt {
         send_auto_submit(&previous);
     }
@@ -454,6 +458,10 @@ fn on_timer(_hwnd: HWND, shared: &WinTxShared) {
         info!("[reliable-paste] settling: no read within timeout, restoring anyway");
     }
 
+    if receipt && !injection_failed {
+        shared.completion.complete(&shared.text);
+    }
+
     // Auto-submit only once the target demonstrably read the transcript;
     // pressing Enter after an unconfirmed paste could submit stale content.
     if shared.auto_submit && receipt {
@@ -579,8 +587,10 @@ pub(super) fn run(
     auto_submit: bool,
     auto_submit_key: AutoSubmitKey,
     clipboard_handling: ClipboardHandling,
+    completion: PasteCompletion,
 ) -> Result<(), String> {
     let shared = Arc::new(WinTxShared {
+        completion,
         state: Mutex::new(TxState::new()),
         text: text.to_string(),
         snapshot: Mutex::new(Vec::new()),

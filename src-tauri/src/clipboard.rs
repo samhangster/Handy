@@ -7,6 +7,7 @@ use log::info;
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -771,7 +772,32 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
-pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
+type PasteCallback = Box<dyn FnOnce(&str) + Send>;
+
+/// A one-shot insertion acknowledgement shared by a paste and its fallback.
+/// Reliable paste acknowledges a clipboard read; legacy/direct paste can only
+/// acknowledge successful input dispatch. Merely preparing text never commits.
+#[derive(Clone)]
+pub(crate) struct PasteCompletion(Arc<Mutex<Option<PasteCallback>>>);
+
+impl PasteCompletion {
+    pub(crate) fn new(callback: impl FnOnce(&str) + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::new(callback)))))
+    }
+
+    pub(crate) fn complete(&self, inserted_text: &str) {
+        let callback = self.0.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(callback) = callback {
+            callback(inserted_text);
+        }
+    }
+}
+
+pub(crate) fn paste(
+    text: String,
+    app_handle: AppHandle,
+    completion: PasteCompletion,
+) -> Result<(), String> {
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
@@ -819,6 +845,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                         settings.auto_submit,
                         settings.auto_submit_key,
                         settings.clipboard_handling,
+                        completion.clone(),
                     )
                 });
                 match reliable_result {
@@ -846,6 +873,18 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
         }
     }
 
+    // Clipboard-only output does not insert anything. An external script may
+    // write anywhere, so it cannot establish this editor's continuation state.
+    if matches!(
+        paste_method,
+        PasteMethod::Direct
+            | PasteMethod::CtrlV
+            | PasteMethod::CtrlShiftV
+            | PasteMethod::ShiftInsert
+    ) {
+        completion.complete(&text);
+    }
+
     if should_send_auto_submit(settings.auto_submit, paste_method) {
         std::thread::sleep(Duration::from_millis(50));
         if let Err(error) = with_enigo(&app_handle, |enigo| {
@@ -867,6 +906,30 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn paste_completion_runs_once_across_fallback_clones() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let result = Arc::clone(&calls);
+        let completion = PasteCompletion::new(move |text| {
+            result.lock().unwrap().push(text.to_string());
+        });
+        let fallback = completion.clone();
+        completion.complete("Inserted text ");
+        fallback.complete("Duplicate");
+        assert_eq!(*calls.lock().unwrap(), ["Inserted text "]);
+    }
+
+    #[test]
+    fn abandoned_paste_does_not_acknowledge_insertion() {
+        let acknowledged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = Arc::clone(&acknowledged);
+        let completion = PasteCompletion::new(move |_| {
+            result.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        drop(completion);
+        assert!(!acknowledged.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[cfg(target_os = "linux")]
     const YDOTOOL_0_1_8_HELP: &str = r#"

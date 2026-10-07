@@ -25,16 +25,65 @@ mod signal_handle;
 mod text_formatting;
 
 /// Read-only diagnostic: exposes only a capitalization decision and supplied sample text.
-pub fn preview_text_formatting(text: &str) -> serde_json::Value {
-    let (context, status) = editor_context::diagnostic();
+pub fn preview_text_formatting(app: &tauri::AppHandle, text: &str) -> serde_json::Value {
+    let context = editor_context::capture();
+    let settings = settings::get_settings(app);
     serde_json::json!({
-        "cursor_capitalization": context,
-        "context_status": status,
-        "context_target_pid": editor_context::target().map(|target| target.0),
-        "formatted": text_formatting::finish_dictation_for_target(
-            text, &text_formatting::TextFormatting::default(), context, editor_context::target(),
+        "captured_at_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "cursor_capitalization": context.capitalization(),
+        "context": context.diagnostic(),
+        "formatted": text_formatting::finish_with_context(
+            text, &settings.text_formatting, context.capitalization(),
         ),
     })
+}
+
+fn schedule_formatting_preview(app: &tauri::AppHandle, text: String, delay_ms: u64) {
+    let requested_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(10_000)));
+        let handle = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            let mut preview = preview_text_formatting(&handle, &text);
+            preview["requested_at_unix_ms"] = serde_json::json!(requested_at);
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                use std::io::Write;
+                let directory = handle.path().app_data_dir()?;
+                let temporary = directory.join(format!(
+                    ".format-preview-{}-{}.json",
+                    std::process::id(),
+                    requested_at
+                ));
+                let mut options = std::fs::OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temporary)?;
+                let write_result = (|| -> Result<(), std::io::Error> {
+                    file.write_all(preview.to_string().as_bytes())?;
+                    std::fs::rename(&temporary, directory.join("format-preview.json"))
+                })();
+                if write_result.is_err() {
+                    let _ = std::fs::remove_file(&temporary);
+                }
+                write_result?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                log::warn!("Could not save formatting preview: {}", error);
+            }
+        }) {
+            log::warn!("Could not schedule formatting preview: {}", error);
+        }
+    });
 }
 mod transcription_coordinator;
 mod tray;
@@ -164,7 +213,8 @@ fn apply_startup_activation_policy(app: &mut tauri::App, headless_mode: bool) {
     let cli_args = app.state::<CliArgs>().inner().clone();
     let settings = settings::get_settings(app.handle());
 
-    let should_hide = settings.start_hidden || cli_args.start_hidden;
+    let should_hide =
+        settings.start_hidden || cli_args.start_hidden || cli_args.format_preview.is_some();
     let tray_available = settings.show_tray_icon && !cli_args.no_tray;
 
     if should_hide && tray_available {
@@ -868,17 +918,12 @@ pub fn run(cli_args: CliArgs) {
     // instance instead.
     if !headless_mode {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if let Some(index) = args.iter().position(|a| a == "--format-preview") {
-                if let (Some(text), Ok(directory)) =
-                    (args.get(index + 1), app.path().app_data_dir())
-                {
-                    let preview = preview_text_formatting(text);
-                    if let Err(error) =
-                        std::fs::write(directory.join("format-preview.json"), preview.to_string())
-                    {
-                        log::warn!("Could not save formatting preview: {}", error);
-                    }
-                }
+            let remote_args = <CliArgs as clap::Parser>::try_parse_from(&args).ok();
+            if let Some((text, delay_ms)) = remote_args.and_then(|args| {
+                args.format_preview
+                    .map(|text| (text, args.format_preview_delay_ms.unwrap_or(0)))
+            }) {
+                schedule_formatting_preview(app, text, delay_ms);
             } else if args.iter().any(|a| a == "--toggle-transcription") {
                 signal_handle::send_transcription_input(app, "transcribe", "CLI");
             } else if args.iter().any(|a| a == "--toggle-post-process") {
@@ -1072,7 +1117,9 @@ pub fn run(cli_args: CliArgs) {
             // Show main window only if not starting hidden.
             // CLI --start-hidden flag overrides the setting.
             // But if permission onboarding is required, always show the window.
-            let should_hide = settings.start_hidden || cli_args.start_hidden;
+            let should_hide = settings.start_hidden
+                || cli_args.start_hidden
+                || cli_args.format_preview.is_some();
             let should_force_show = should_force_show_permissions_window(&app_handle);
 
             // If start_hidden but tray is disabled, we must show the window
@@ -1081,6 +1128,14 @@ pub fn run(cli_args: CliArgs) {
             let tray_available = settings.show_tray_icon && !cli_args.no_tray;
             if should_force_show || !should_hide || !tray_available {
                 show_main_window(&app_handle);
+            }
+
+            if let Some(text) = cli_args.format_preview.clone() {
+                schedule_formatting_preview(
+                    &app_handle,
+                    text,
+                    cli_args.format_preview_delay_ms.unwrap_or(0),
+                );
             }
 
             Ok(())

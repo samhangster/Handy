@@ -25,7 +25,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use super::{evaluate, send_chord, TxState, WaitDecision};
-use crate::clipboard::send_return_key;
+use crate::clipboard::{send_return_key, PasteCompletion};
 use crate::input::EnigoState;
 use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
 
@@ -107,6 +107,7 @@ struct MacPending {
     preserve_transcript: bool,
     /// The transcript, for the `preserve_transcript` re-write at settle time.
     transcript: String,
+    completion: PasteCompletion,
     settled: bool,
 }
 
@@ -132,10 +133,18 @@ fn settle(
     }
     p.settled = true;
 
-    let (receipt_seen, ownership_lost) = match p.state.lock() {
-        Ok(st) => (st.any_receipt_after_injection(), st.ownership_lost),
-        Err(_) => (false, true),
+    let (receipt_seen, ownership_lost, injection_failed) = match p.state.lock() {
+        Ok(st) => (
+            st.any_receipt_after_injection(),
+            st.ownership_lost,
+            st.injection_failed,
+        ),
+        Err(_) => (false, true, true),
     };
+
+    if receipt_seen && !injection_failed {
+        p.completion.complete(&p.transcript);
+    }
 
     // Auto-submit only once the target demonstrably read the transcript;
     // pressing Enter after an unconfirmed paste could submit stale content.
@@ -261,6 +270,7 @@ pub(super) fn run(
     auto_submit: bool,
     auto_submit_key: AutoSubmitKey,
     clipboard_handling: ClipboardHandling,
+    completion: PasteCompletion,
 ) -> Result<(), String> {
     // Settle any previous transaction first so the snapshot below captures the
     // user's original clipboard, not the previous transcript.
@@ -325,6 +335,7 @@ pub(super) fn run(
         auto_submit_key,
         preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
         transcript: text.to_string(),
+        completion,
         settled: false,
     }));
     if let Ok(mut slot) = PENDING.lock() {

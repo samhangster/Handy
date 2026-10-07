@@ -172,147 +172,110 @@ pub fn replace_spoken(text: &str, config: &TextFormatting) -> String {
     result
 }
 
+/// Format a fragment without editor context. Context-aware dictation should call
+/// `finish_with_context`; this helper treats the fragment as a continuation.
 pub fn finish(text: &str, config: &TextFormatting) -> String {
+    finish_with_context(text, config, Some(false))
+}
+
+/// Format a dictation using the insertion context supplied by the caller.
+/// Unknown context starts with a capital; successful-output fallback belongs to
+/// the paste pipeline, so previews and failed/cancelled pastes have no side effects.
+pub fn finish_with_context(
+    text: &str,
+    config: &TextFormatting,
+    capitalize: Option<bool>,
+) -> String {
     if !config.enabled {
         return text.into();
     }
-    let mut result = replace_spoken(text, config);
-    if config.initial_capitalization == InitialCapitalization::AfterPeriod {
-        let mut pending = Some(false);
-        result = result
-            .chars()
-            .flat_map(|c| {
-                if matches!(c, '\u{e000}' | '?' | '!' | '\n' | '\r') {
+    let replaced = replace_spoken(text, config);
+    let chars: Vec<_> = replaced.chars().collect();
+    let final_index = chars
+        .iter()
+        .rposition(|c| !c.is_whitespace() && !is_closing_punctuation(*c));
+    let mut pending = Some(capitalize.unwrap_or(true));
+    let mut result = String::new();
+
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = i.checked_sub(1).and_then(|p| chars.get(p)).copied();
+        let next = chars.get(i + 1).copied();
+        let decimal =
+            prev.is_some_and(|v| v.is_ascii_digit()) && next.is_some_and(|v| v.is_ascii_digit());
+        let ellipsis = prev == Some('.') || next == Some('.');
+        let sentence_period = c == '.'
+            && !decimal
+            && next.is_none_or(|v| v.is_whitespace() || is_closing_punctuation(v));
+        let remove = c == '.'
+            && !decimal
+            && (!ellipsis || config.periods == PeriodHandling::SpokenOnly)
+            && match config.periods {
+                PeriodHandling::Keep => false,
+                PeriodHandling::RemoveFinal => Some(i) == final_index,
+                PeriodHandling::RemoveSentence => sentence_period,
+                PeriodHandling::SpokenOnly => true,
+            };
+
+        if config.initial_capitalization == InitialCapitalization::AfterPeriod {
+            if matches!(c, '\u{e000}' | '?' | '!' | '\n' | '\r') {
+                // A boundary dictated within this fragment takes precedence over
+                // the editor's preceding unfinished sentence.
+                pending = Some(true);
+            } else if sentence_period {
+                if !remove {
                     pending = Some(true);
-                } else if c == '.' && pending != Some(true) {
+                } else if pending != Some(true) {
+                    // Remove the recognizer's sentence capitalization together
+                    // with its automatic period, but preserve an explicit boundary.
                     pending = Some(false);
                 }
-                if c.is_alphabetic() {
-                    if let Some(upper) = pending.take() {
-                        return if upper {
-                            c.to_uppercase().collect::<Vec<_>>()
-                        } else {
-                            c.to_lowercase().collect::<Vec<_>>()
-                        };
+            }
+            if c.is_alphabetic() {
+                if let Some(upper) = pending.take() {
+                    if upper {
+                        result.extend(c.to_uppercase());
+                    } else {
+                        result.extend(c.to_lowercase());
                     }
+                    continue;
                 }
-                vec![c]
-            })
-            .collect();
+            }
+        }
+        if !remove {
+            result.push(if c == '\u{e000}' { '.' } else { c });
+        }
     }
-    if config.periods != PeriodHandling::Keep {
-        let chars: Vec<_> = result.chars().collect();
-        let final_index = chars
-            .iter()
-            .rposition(|c| !c.is_whitespace() && !matches!(c, '"' | '”' | '’' | ')'));
-        result = chars
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &c)| {
-                let prev = i.checked_sub(1).and_then(|p| chars.get(p)).copied();
-                let next = chars.get(i + 1).copied();
-                let decimal_or_ellipsis = prev == Some('.')
-                    || next == Some('.')
-                    || (prev.is_some_and(|v| v.is_ascii_digit())
-                        && next.is_some_and(|v| v.is_ascii_digit()));
-                let remove = c == '.'
-                    && (!decimal_or_ellipsis
-                        || (config.periods == PeriodHandling::SpokenOnly
-                            && !(prev.is_some_and(|v| v.is_ascii_digit())
-                                && next.is_some_and(|v| v.is_ascii_digit()))))
-                    && match config.periods {
-                        PeriodHandling::RemoveFinal => Some(i) == final_index,
-                        PeriodHandling::RemoveSentence => next.is_none_or(|v| {
-                            v.is_whitespace() || matches!(v, '"' | '”' | '’' | ')')
-                        }),
-                        PeriodHandling::SpokenOnly => true,
-                        PeriodHandling::Keep => false,
-                    };
-                (!remove).then_some(c)
-            })
-            .collect();
-    }
-    if !matches!(
+
+    if matches!(
         config.initial_capitalization,
-        InitialCapitalization::Keep | InitialCapitalization::AfterPeriod
+        InitialCapitalization::Lower | InitialCapitalization::Upper
     ) {
         if let Some((index, first)) = result.char_indices().find(|(_, c)| c.is_alphabetic()) {
             let replacement: String = match config.initial_capitalization {
                 InitialCapitalization::Lower => first.to_lowercase().collect(),
                 InitialCapitalization::Upper => first.to_uppercase().collect(),
-                InitialCapitalization::Keep | InitialCapitalization::AfterPeriod => {
-                    first.to_string()
-                }
+                _ => unreachable!(),
             };
             result.replace_range(index..index + first.len_utf8(), &replacement);
         }
     }
-    result.replace('\u{e000}', ".")
-}
-
-/// Carry sentence boundaries across consecutive dictations in this app session.
-#[cfg(test)]
-pub fn finish_dictation(text: &str, config: &TextFormatting) -> String {
-    finish_dictation_with_context(text, config, None)
-}
-
-#[cfg(test)]
-pub fn finish_dictation_with_context(
-    text: &str,
-    config: &TextFormatting,
-    cursor_capitalization: Option<bool>,
-) -> String {
-    finish_dictation_for_target(text, config, cursor_capitalization, None)
-}
-
-pub fn finish_dictation_for_target(
-    text: &str,
-    config: &TextFormatting,
-    cursor_capitalization: Option<bool>,
-    target: Option<(i32, usize)>,
-) -> String {
-    static SESSION: std::sync::Mutex<(Option<(i32, usize)>, bool)> =
-        std::sync::Mutex::new((None, true));
-    let Ok(mut session) = SESSION.lock() else {
-        return finish(text, config);
-    };
-    finish_with_session(text, config, cursor_capitalization, target, &mut session)
-}
-
-type EditorSession = (Option<(i32, usize)>, bool);
-fn finish_with_session(
-    text: &str,
-    config: &TextFormatting,
-    cursor_capitalization: Option<bool>,
-    target: Option<(i32, usize)>,
-    session: &mut EditorSession,
-) -> String {
-    if target.is_some() && session.0 != target {
-        *session = (target, true);
-    }
-    let after_period = &mut session.1;
-
-    let mut result = finish(text, config);
-    if config.enabled
-        && config.initial_capitalization == InitialCapitalization::AfterPeriod
-        && cursor_capitalization.unwrap_or(*after_period)
-    {
-        if let Some((index, first)) = result.char_indices().find(|(_, c)| c.is_alphabetic()) {
-            result.replace_range(
-                index..index + first.len_utf8(),
-                &first.to_uppercase().collect::<String>(),
-            );
-        }
-    }
-    if !result.trim().is_empty() {
-        *after_period = config.enabled
-            && (result
-                .trim_end()
-                .trim_end_matches(['\"', '”', '’', ')', ']'])
-                .ends_with(['.', '?', '!'])
-                || result.ends_with('\n'));
-    }
     result
+}
+
+fn is_closing_punctuation(c: char) -> bool {
+    matches!(c, '\"' | '\'' | '”' | '’' | ')' | ']' | '}' | '»' | '›')
+}
+
+/// Whether successfully inserted text leaves the caret at a new sentence/line.
+/// Horizontal trailing whitespace preserves the boundary, including after a
+/// newline-only dictation. Empty/space-only fragments do not create a boundary.
+pub fn ends_at_sentence_boundary(text: &str) -> bool {
+    let tail = text.trim_end_matches(|c: char| c.is_whitespace() && c != '\n' && c != '\r');
+    if tail.ends_with(['\n', '\r']) {
+        return true;
+    }
+    tail.trim_end_matches(is_closing_punctuation)
+        .ends_with(['.', '?', '!'])
 }
 
 #[cfg(test)]
@@ -329,43 +292,134 @@ mod tests {
         }
     }
     #[test]
-    fn changing_editor_does_not_inherit_an_unfinished_sentence() {
+    fn insertion_context_controls_only_the_initial_sentence() {
         let c = TextFormatting::default();
-        let mut session = (None, false);
+        assert_eq!(finish_with_context("Hello world.", &c, None), "Hello world");
         assert_eq!(
-            finish_with_session("hello", &c, None, Some((42, 1)), &mut session),
-            "Hello"
+            finish_with_context("Hello world.", &c, Some(true)),
+            "Hello world"
         );
         assert_eq!(
-            finish_with_session("next", &c, Some(false), Some((42, 2)), &mut session),
-            "next"
+            finish_with_context("Hello world.", &c, Some(false)),
+            "hello world"
         );
         assert_eq!(
-            finish_with_session("after", &c, Some(true), Some((42, 3)), &mut session),
-            "After"
+            finish_with_context("World period Next", &c, Some(false)),
+            "world. Next"
         );
         assert_eq!(
-            finish_with_session("new editor", &c, None, Some((43, 1)), &mut session),
-            "New editor"
+            finish_with_context("new line hello", &c, Some(false)),
+            "\nHello"
+        );
+        assert_eq!(
+            finish_with_context("period hello", &c, Some(false)),
+            ". Hello"
+        );
+        assert_eq!(
+            finish_with_context("question mark hello", &c, Some(false)),
+            "? Hello"
+        );
+        assert_eq!(
+            finish_with_context("exclamation point hello", &c, Some(false)),
+            "! Hello"
+        );
+        // Formatting another editor or running a preview cannot alter any decision.
+        assert_eq!(
+            finish_with_context("Unrelated sentence", &c, Some(true)),
+            "Unrelated sentence"
+        );
+        assert_eq!(
+            finish_with_context("Still continuing", &c, Some(false)),
+            "still continuing"
+        );
+        assert_eq!(
+            finish_with_context("Unknown editor", &c, None),
+            "Unknown editor"
         );
     }
 
     #[test]
-    fn question_marks_and_exclamations_start_sentences() {
+    fn boundaries_include_punctuation_only_and_indented_newlines() {
+        for text in [
+            ".",
+            "?",
+            "!",
+            "Hello.  ",
+            "Hello?\" ",
+            "Hello!')  ",
+            "\n",
+            "\r\n\t ",
+            "hello\n  ",
+        ] {
+            assert!(
+                ends_at_sentence_boundary(text),
+                "expected boundary: {text:?}"
+            );
+        }
+        for text in [
+            "",
+            "  ",
+            "hello",
+            "hello ",
+            "hello, ",
+            "hello;",
+            "hello\ncontinued",
+            "3.14",
+        ] {
+            assert!(
+                !ends_at_sentence_boundary(text),
+                "unexpected boundary: {text:?}"
+            );
+        }
         let c = TextFormatting::default();
-        assert_eq!(finish("Hello? next! again", &c), "hello? Next! Again");
-        let mut session = (None, false);
+        for command in [
+            "new line",
+            "new paragraph",
+            "period",
+            "question mark",
+            "exclamation point",
+        ] {
+            let output = finish_with_context(command, &c, Some(false));
+            assert!(
+                ends_at_sentence_boundary(&output),
+                "command: {command:?}, output: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capitalization_follows_the_periods_that_are_retained() {
+        let mut c = TextFormatting::default();
+        c.periods = PeriodHandling::Keep;
         assert_eq!(
-            finish_with_session("hello question mark", &c, None, Some((10, 1)), &mut session),
-            "Hello?"
+            finish_with_context("hello. next", &c, Some(true)),
+            "Hello. Next"
         );
         assert_eq!(
-            finish_with_session("next", &c, None, Some((10, 1)), &mut session),
-            "Next"
+            finish_with_context("hello. next", &c, Some(false)),
+            "hello. Next"
         );
         assert_eq!(
-            finish_with_session("continuing", &c, None, Some((10, 1)), &mut session),
-            "continuing"
+            finish_with_context("hello? next! again", &c, Some(false)),
+            "hello? Next! Again"
+        );
+        assert_eq!(
+            finish_with_context("value 3.14 meters. next", &c, Some(false)),
+            "value 3.14 meters. Next"
+        );
+        assert_eq!(
+            finish_with_context("visit example.com today. next", &c, Some(false)),
+            "visit example.com today. Next"
+        );
+        c.periods = PeriodHandling::RemoveFinal;
+        assert_eq!(
+            finish_with_context("hello. next.", &c, Some(true)),
+            "Hello. Next"
+        );
+        c.periods = PeriodHandling::SpokenOnly;
+        assert_eq!(
+            finish_with_context("Hello. Next period Again.", &c, Some(true)),
+            "Hello next. Again"
         );
     }
 
@@ -388,23 +442,14 @@ mod tests {
             "hello.  Next sentence"
         );
         assert_eq!(finish("Hello new line next line.", &c), "hello\nNext line");
+        assert_eq!(finish_with_context("Hello.", &c, Some(true)), "Hello");
         assert_eq!(
-            finish_dictation_with_context("Hello.", &c, Some(true)),
-            "Hello"
-        );
-        assert_eq!(
-            finish_dictation_with_context("Hello period", &c, Some(true)),
+            finish_with_context("Hello period", &c, Some(true)),
             "Hello."
         );
         assert_eq!(
-            finish_dictation_with_context("Next word.", &c, Some(false)),
+            finish_with_context("Next word.", &c, Some(false)),
             "next word"
-        );
-        assert_eq!(finish_dictation("Hello period", &c), "hello.");
-        assert_eq!(finish_dictation("Next sentence.", &c), "Next sentence");
-        assert_eq!(
-            finish_dictation("Another sentence.", &c),
-            "another sentence"
         );
     }
     #[test]
@@ -428,11 +473,58 @@ mod tests {
         assert_eq!(finish("Hello. World.", &c), "hello World");
     }
     #[test]
-    fn unicode_and_empty_input() {
-        let mut c = config();
+    fn unicode_and_internal_names_keep_their_case() {
+        let c = TextFormatting::default();
+        assert_eq!(
+            finish_with_context(
+                "Continue with NASA, iPhone, McDonald and Élan.",
+                &c,
+                Some(false)
+            ),
+            "continue with NASA, iPhone, McDonald and Élan"
+        );
+        assert_eq!(
+            finish_with_context("\"Élan\" and Örebro", &c, Some(false)),
+            "\"élan\" and Örebro"
+        );
+        assert_eq!(
+            finish_with_context("éclair period über", &c, Some(true)),
+            "Éclair. Über"
+        );
+        assert_eq!(finish_with_context("ßeta", &c, Some(true)), "SSeta");
+        assert_eq!(finish_with_context("😀 élève", &c, Some(true)), "😀 Élève");
+        assert_eq!(finish_with_context("", &c, None), "");
+    }
+
+    #[test]
+    fn explicit_case_preferences_ignore_context_and_newlines_survive() {
+        let mut c = TextFormatting::default();
         c.initial_capitalization = InitialCapitalization::Lower;
-        assert_eq!(finish("\"Élan.\"", &c), "\"élan.\"");
-        assert_eq!(finish("", &c), "");
+        assert_eq!(finish_with_context("\"Élan.\"", &c, Some(true)), "\"élan\"");
+        c.initial_capitalization = InitialCapitalization::Upper;
+        assert_eq!(finish_with_context("élan", &c, Some(false)), "Élan");
+        c.initial_capitalization = InitialCapitalization::Keep;
+        assert_eq!(finish_with_context("eBay", &c, Some(true)), "eBay");
+        c = TextFormatting::default();
+        assert_eq!(finish_with_context("new line.", &c, Some(false)), "\n");
+        assert_eq!(
+            finish_with_context("new paragraph hello", &c, Some(false)),
+            "\n\nHello"
+        );
+        assert_eq!(
+            finish_with_context("Hello.\nNext.", &c, Some(false)),
+            "hello\nNext"
+        );
+        c.periods = PeriodHandling::RemoveFinal;
+        assert_eq!(
+            finish_with_context("hello. \"next.\" ", &c, Some(true)),
+            "Hello. \"Next\" "
+        );
+        c.enabled = false;
+        assert_eq!(
+            finish_with_context("Hello period. Next.", &c, Some(false)),
+            "Hello period. Next."
+        );
     }
     #[test]
     fn rules_are_literal_non_recursive_and_validated() {

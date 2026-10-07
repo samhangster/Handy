@@ -199,6 +199,7 @@ pub(crate) fn try_reliable_paste(
     auto_submit: bool,
     auto_submit_key: crate::settings::AutoSubmitKey,
     clipboard_handling: crate::settings::ClipboardHandling,
+    completion: crate::clipboard::PasteCompletion,
 ) -> Result<(), String> {
     platform::run(
         text,
@@ -208,6 +209,7 @@ pub(crate) fn try_reliable_paste(
         auto_submit,
         auto_submit_key,
         clipboard_handling,
+        completion,
     )
 }
 
